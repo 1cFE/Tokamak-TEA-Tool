@@ -1,0 +1,668 @@
+"""TokamakSizeOptimizatIonTool — Outside-in reactor sizing module.
+
+Given P_net and Q_eng as fixed inputs, derives P_fusion from a top-down power
+balance, then sweeps ion temperature to find the minimum feasible major radius
+satisfying physics constraints (Greenwald density, Troyon beta, kink stability,
+and energy confinement) and engineering constraints (neutron wall load,
+divertor heat exhaust P_sep/R).
+
+Usage:
+    from tokamak_sizing.sizing import SizingInputs, TokamakSizeOptimizatIonTool
+    result = TokamakSizeOptimizatIonTool(SizingInputs(p_net_mw=500, q_eng=3.0))
+"""
+
+from dataclasses import dataclass, field
+import warnings
+import numpy as np
+
+from tokamak_sizing import constants
+from tokamak_sizing.confinement_time import iter_ipb98y2_confinement_time
+from tokamak_sizing.fusion_reactions import (
+    BoschHaleConstants,
+    REACTION_CONSTANTS_DT,
+    REACTION_CONSTANTS_DHE3,
+    REACTION_CONSTANTS_DD1,
+    REACTION_CONSTANTS_DD2,
+    bosch_hale_reactivity,
+)
+from tokamak_sizing.plasma_geometry import sauter_geometry
+
+
+# ---------------------------------------------------------------------------
+# Blanket parameters database
+# ---------------------------------------------------------------------------
+
+BLANKET_PARAMS = {
+    # m_blanket, p_nw_max [MW/m^2], struct_overhead [m], Chiletti TBR model params
+    "HCPB":  {"m": 1.14, "nwl": 2.0,  "struct_overhead_m": 0.47,
+              "tbr_sat": None, "tbr_t0_cm": None, "tbr_alpha": None,
+              "tbr_beta": None, "tbr_lambda": None},
+    "WCLL":  {"m": 1.18, "nwl": 2.5,  "struct_overhead_m": 0.47,
+              "tbr_sat": 1.412, "tbr_t0_cm": 30.4, "tbr_alpha": 0.884,
+              "tbr_beta": 1.565, "tbr_lambda": 0.800},
+    "DCLL":  {"m": 1.22, "nwl": 4.0,  "struct_overhead_m": 0.47,
+              "tbr_sat": None, "tbr_t0_cm": None, "tbr_alpha": None,
+              "tbr_beta": None, "tbr_lambda": None},
+    "FLiBe": {"m": 1.20, "nwl": 10.0, "struct_overhead_m": 0.30,
+              "tbr_sat": None, "tbr_t0_cm": None, "tbr_alpha": None,
+              "tbr_beta": None, "tbr_lambda": None},
+    "LiPb":  {"m": 1.28, "nwl": 5.0,  "struct_overhead_m": 0.47,
+              "tbr_sat": None, "tbr_t0_cm": None, "tbr_alpha": None,
+              "tbr_beta": None, "tbr_lambda": None},
+}
+
+
+# ---------------------------------------------------------------------------
+# Superconductor parameters database
+# ---------------------------------------------------------------------------
+
+SC_PARAMS = {
+    #               b_peak [T]   sigma_tf [MPa]   tf_frac (TF fraction of IB stack)
+    "NbTi":   {"b_peak": 8.0,  "sigma": 660, "tf_frac": 0.30},   # LTS, most shielding at 4K
+    "Nb3Sn":  {"b_peak": 12.0, "sigma": 660, "tf_frac": 0.33},   # LTS, thick cryo+neutron shielding at 4K
+    "REBCO":  {"b_peak": 20.0, "sigma": 900, "tf_frac": 0.50},   # HTS, thin cryo shielding at 20-30K
+}
+
+
+# ---------------------------------------------------------------------------
+# Data classes
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SizingInputs:
+    """All fixed inputs for the outside-in sizing."""
+
+    # Power targets
+    p_net_mw: float  # Net electric power (MW)
+    q_eng: float  # Engineering gain = P_gross / P_recirc
+
+    # Efficiencies
+    eta_thermal: float = 0.40  # Thermal-to-electric conversion
+    eta_wall_plug: float = 0.50  # HCD wall-plug efficiency
+    eta_absorption: float = 0.90  # Plasma heating absorption efficiency
+    f_aux_recirc: float = 0.50  # Fraction of P_recirc NOT going to HCD
+
+    # Blanket — blanket_type sets defaults for m_blanket, p_nw_max, thickness
+    blanket_type: str = "HCPB"
+    m_blanket: float = None            # Override blanket energy multiplication
+    p_nw_max: float = None             # Override max neutron wall load [MW/m^2]
+    tbr_target: float = 1.10           # Target average TBR for breeding zone thickness
+    f_hole: float = 0.15               # Fraction of FW area not covered by blanket (ports, divertors)
+    blanket_thickness_m: float = None  # Override total blanket thickness [m]
+
+    # Geometry
+    aspect: float = 3.1
+    kappa: float = 1.65
+    triang: float = 0.33
+
+    # Superconductor / TF coil
+    sc_type: str = "Nb3Sn"        # Superconductor type (key into SC_PARAMS)
+    b_t: float = None             # Toroidal field on axis [T] (auto from SC + geometry)
+    b_t_fraction: float = 1.0     # Fraction of max B_t to operate at (0-1)
+    sigma_tf_mpa: float = None    # TF stress allowable [MPa] (auto from SC)
+    b_peak_t: float = None        # Peak field at TF coil [T] (auto from SC)
+    f_tf_struc: float = 0.5       # Structural fraction of TF coil cross-section
+    tf_build_margin: float = None  # 1/tf_frac; auto-resolved from sc_type
+    tf_build_buffer: float = 0.8  # Non-TF inboard build: VV, thermal shield, insulation, gaps [m]
+
+    # Fuel
+    fuel_type: str = "DT"  # "DT" or "DHe3"
+
+    # Physics limits
+    q95_min: float = 3.0
+    beta_n_max: float = 2.8
+    h_max: float = 1.3
+    f_gw_max: float = 1.0
+
+    # Engineering limits
+    p_sep_r_max: float = None  # Max P_sep/R [MW/m] (auto: 40 conv, 60 ST)
+
+    # Temperature sweep
+    t_i_range_kev: tuple = (8.0, 30.0)
+    t_i_steps: int = 50
+
+    # Profile factor for volume-averaged fusion power
+    profile_factor: float = 2.0
+
+    # Radiation fraction
+    f_rad: float = 0.0
+
+    # Fuel dilution
+    f_fuel_dilution: float = 1.0
+
+    def __post_init__(self):
+        # Blanket parameters
+        if self.blanket_type not in BLANKET_PARAMS:
+            raise ValueError(
+                f"Unknown blanket_type '{self.blanket_type}'. "
+                f"Choose from: {list(BLANKET_PARAMS.keys())}"
+            )
+        bp = BLANKET_PARAMS[self.blanket_type]
+        if self.m_blanket is None:
+            self.m_blanket = bp["m"]
+        if self.p_nw_max is None:
+            self.p_nw_max = bp["nwl"]
+        if self.blanket_thickness_m is None:
+            if bp["tbr_sat"] is not None:
+                tbr_local = self.tbr_target / (1.0 - self.f_hole)
+                if tbr_local >= bp["tbr_sat"]:
+                    warnings.warn(
+                        f"Required local TBR ({tbr_local:.3f}) for average "
+                        f"TBR={self.tbr_target} with f_hole={self.f_hole:.0%} "
+                        f"exceeds {self.blanket_type} saturation TBR "
+                        f"({bp['tbr_sat']}). Using saturation thickness.",
+                        stacklevel=2,
+                    )
+                    tbr_local = bp["tbr_sat"] * 0.95
+                bz = compute_breeding_zone_thickness(
+                    tbr_local, bp["tbr_sat"], bp["tbr_t0_cm"],
+                    bp["tbr_alpha"], bp["tbr_beta"], bp["tbr_lambda"],
+                )
+                self.blanket_thickness_m = bz + bp["struct_overhead_m"]
+            else:
+                self.blanket_thickness_m = 0.70
+        if self.p_sep_r_max is None:
+            self.p_sep_r_max = 60.0 if self.aspect < 2.5 else 40.0
+
+        # Superconductor parameters
+        if self.sc_type not in SC_PARAMS:
+            raise ValueError(
+                f"Unknown sc_type '{self.sc_type}'. "
+                f"Choose from: {list(SC_PARAMS.keys())}"
+            )
+        sc = SC_PARAMS[self.sc_type]
+        if self.sigma_tf_mpa is None:
+            self.sigma_tf_mpa = sc["sigma"]
+        if self.b_peak_t is None:
+            self.b_peak_t = sc["b_peak"]
+        if self.tf_build_margin is None:
+            self.tf_build_margin = 1.0 / sc["tf_frac"]
+
+        # Derive B_t from SC + geometry if not explicitly set
+        if self.b_t is None:
+            mu0 = 4.0 * np.pi * 1e-7
+            k_tf = self.b_peak_t**2 / (
+                2.0 * mu0 * self.f_tf_struc * self.sigma_tf_mpa * 1e6
+            )
+            b_t_max = self.b_peak_t * (1.0 - 1.0 / self.aspect) / (1.0 + k_tf)
+            self.b_t = self.b_t_fraction * b_t_max
+
+
+@dataclass
+class PowerBalanceResult:
+    """Results of the top-down power balance (Step 0)."""
+
+    p_gross_mw: float
+    p_recirc_mw: float
+    p_thermal_mw: float
+    p_fusion_mw: float
+    p_hcd_injected_mw: float
+    q_plasma: float
+    p_loss_mw: float
+    p_alpha_mw: float
+    p_neutron_mw: float
+
+
+@dataclass
+class PointResult:
+    """Physics results at a single (T_i, R) operating point."""
+
+    t_i_kev: float
+    r_major_m: float
+    a_minor_m: float
+    vol_plasma_m3: float
+    n_e_m3: float
+    i_p_ma: float
+    beta_n: float
+    h_required: float
+    f_gw: float
+    tau_e_required_s: float
+    tau_e_nominal_s: float
+    w_thermal_mj: float
+    wall_load_mw_m2: float
+    p_sep_r_mw_m: float
+    delta_tf_m: float
+    blanket_thickness_m: float
+    feasible: bool
+    binding_constraint: str
+
+
+@dataclass
+class SizingResult:
+    """Full output of the sizing module."""
+
+    r_major_m: float
+    t_i_optimal_kev: float
+    p_fusion_mw: float
+    p_gross_mw: float
+    p_recirc_mw: float
+    p_thermal_mw: float
+    p_hcd_injected_mw: float
+    q_plasma: float
+    n_e_m3: float
+    i_p_ma: float
+    beta_n: float
+    h_required: float
+    f_gw: float
+    binding_constraint: str
+    vol_plasma_m3: float
+    wall_load_mw_m2: float
+    p_sep_r_mw_m: float
+    delta_tf_m: float
+    blanket_thickness_m: float
+
+    # Full sweep
+    power_balance: PowerBalanceResult = None
+    sweep_results: list = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Fuel-type parameters
+# ---------------------------------------------------------------------------
+
+def get_fuel_params(fuel_type: str) -> dict:
+    """Return fuel-dependent parameters."""
+    if fuel_type == "DT":
+        return {
+            "constants": BoschHaleConstants(**REACTION_CONSTANTS_DT),
+            "e_fusion_j": constants.D_T_ENERGY,
+            "f_alpha": 1.0 - constants.DT_NEUTRON_ENERGY_FRACTION,
+            "f_neutron": constants.DT_NEUTRON_ENERGY_FRACTION,
+            "f_fuel": 1.0,
+            "m_fuel_amu": 2.5,
+        }
+    elif fuel_type == "DHe3":
+        return {
+            "constants": BoschHaleConstants(**REACTION_CONSTANTS_DHE3),
+            "e_fusion_j": constants.D_HELIUM_ENERGY,
+            "f_alpha": 1.0 - constants.DHELIUM_PROTON_ENERGY_FRACTION,
+            "f_neutron": 0.0,
+            "f_fuel": 1.0,
+            "m_fuel_amu": 2.5,
+        }
+    else:
+        raise ValueError(f"Unsupported fuel type: {fuel_type}. Use 'DT' or 'DHe3'.")
+
+
+# ---------------------------------------------------------------------------
+# Core physics functions
+# ---------------------------------------------------------------------------
+
+def bosch_hale_scalar(t_i_kev: float, bh_constants: BoschHaleConstants) -> float:
+    """Compute <sigma_v> for a single temperature using Bosch-Hale."""
+    t_arr = np.array([t_i_kev])
+    sv = bosch_hale_reactivity(t_arr, bh_constants)
+    return float(sv[0])
+
+
+def compute_plasma_current(
+    r: float, a: float, b_t: float, kappa: float, kappa95: float,
+    triang: float, triang95: float, q95: float,
+) -> float:
+    """Compute plasma current I_p [A] from safety factor and geometry."""
+    eps = a / r
+    fq = (
+        0.5
+        * (1.17 - 0.65 * eps)
+        / ((1.0 - eps * eps) ** 2)
+        * (1.0 + kappa95**2 * (1.0 + 2.0 * triang95**2 - 1.2 * triang95**3))
+    )
+    return (2.0 * np.pi / constants.RMU0) * a**2 / (r * q95) * fq * b_t
+
+
+def compute_greenwald_density(i_p_a: float, a: float) -> float:
+    """Greenwald density limit [m^-3]."""
+    return 1.0e14 * i_p_a / (np.pi * a**2)
+
+
+def compute_first_wall_area(r: float, a: float, kappa: float) -> float:
+    """Approximate first wall surface area [m^2]."""
+    return 4.0 * np.pi**2 * r * a * np.sqrt((1.0 + kappa**2) / 2.0)
+
+
+def compute_tf_coil_thickness(
+    r: float, aspect: float, b_peak: float, sigma_pa: float,
+    f_struc: float,
+) -> float:
+    """Stress-driven TF coil radial thickness [m].
+
+    k = B_peak² / (2μ₀ × f_struc × σ)
+    Δ_TF = k × R_inboard / (1 + k)
+
+    The full inboard build requirement is computed externally as:
+        IB_required = Δ_TF × tf_build_margin + tf_build_buffer
+    """
+    mu0 = constants.RMU0
+    r_inboard = r * (1.0 - 1.0 / aspect)
+    k = b_peak**2 / (2.0 * mu0 * f_struc * sigma_pa)
+    return k * r_inboard / (1.0 + k)
+
+
+def compute_breeding_zone_thickness(
+    tbr_target: float,
+    tbr_sat: float,
+    t0_cm: float,
+    alpha: float,
+    beta: float,
+    lam: float,
+) -> float:
+    """Breeding zone thickness [m] for a target TBR (Chiletti et al., 2026).
+
+    Inverts the exponential saturation model for WCLL Pb-15.8%Li (90% Li-6):
+        E_p = t_0 × [-1/β × ln((1 - TBR/TBR_sat) / λ)]^(1/α)
+
+    Returns thickness in metres.
+    """
+    if tbr_target >= tbr_sat:
+        raise ValueError(
+            f"tbr_target={tbr_target} >= tbr_sat={tbr_sat}; "
+            "cannot exceed saturation TBR"
+        )
+    ratio = (1.0 - tbr_target / tbr_sat) / lam
+    if ratio <= 0:
+        raise ValueError(
+            f"TBR target {tbr_target} too close to saturation "
+            f"(max achievable = {tbr_sat * (1 - lam):.3f} without "
+            "infinite thickness)"
+        )
+    e_p_cm = t0_cm * (-np.log(ratio) / beta) ** (1.0 / alpha)
+    return e_p_cm / 100.0  # cm → m
+
+
+# ---------------------------------------------------------------------------
+# Top-down power balance
+# ---------------------------------------------------------------------------
+
+def top_down_power_balance(inp: SizingInputs) -> PowerBalanceResult:
+    """Step 0: Derive all power quantities from P_net and Q_eng."""
+    p_gross = inp.p_net_mw * inp.q_eng / (inp.q_eng - 1.0)
+    p_recirc = p_gross - inp.p_net_mw
+    p_thermal = p_gross / inp.eta_thermal
+
+    fuel = get_fuel_params(inp.fuel_type)
+    f_alpha = fuel["f_alpha"]
+    f_neutron = fuel["f_neutron"]
+
+    p_hcd_electric = (1.0 - inp.f_aux_recirc) * p_recirc
+    p_hcd_injected = p_hcd_electric * inp.eta_wall_plug * inp.eta_absorption
+
+    denom = f_neutron * inp.m_blanket + f_alpha
+    p_fusion = (p_thermal - p_hcd_injected) / denom
+
+    p_alpha = f_alpha * p_fusion
+    p_neutron = f_neutron * p_fusion
+    q_plasma = p_fusion / p_hcd_injected if p_hcd_injected > 0 else float("inf")
+    p_loss = p_alpha + p_hcd_injected
+
+    return PowerBalanceResult(
+        p_gross_mw=p_gross, p_recirc_mw=p_recirc, p_thermal_mw=p_thermal,
+        p_fusion_mw=p_fusion, p_hcd_injected_mw=p_hcd_injected,
+        q_plasma=q_plasma, p_loss_mw=p_loss,
+        p_alpha_mw=p_alpha, p_neutron_mw=p_neutron,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Feasibility check at a single (R, T_i) point
+# ---------------------------------------------------------------------------
+
+def check_feasibility(
+    r: float,
+    t_i_kev: float,
+    sigmav: float,
+    pb: PowerBalanceResult,
+    inp: SizingInputs,
+    fuel: dict,
+) -> PointResult:
+    """Evaluate all constraints at a given (R, T_i) operating point.
+
+    Checks (in order):
+      1. Neutron wall load  — p_nw <= p_nw_max
+      2. P_sep/R            — P_sep/R <= p_sep_r_max
+      3. Greenwald density   — n_e/n_GW <= f_gw_max
+      4. Troyon beta         — beta_N <= beta_N_max
+      5. Energy confinement  — H_req <= H_max
+    """
+    a = r / inp.aspect
+    _, _, _, vol = sauter_geometry(a, r, inp.kappa, inp.triang, 0.0)
+
+    # Engineering metrics (always computed for output)
+    a_fw = compute_first_wall_area(r, a, inp.kappa)
+    wall_load = pb.p_neutron_mw / a_fw
+    p_sep_r = pb.p_loss_mw * (1.0 - inp.f_rad) / r
+    delta_tf = compute_tf_coil_thickness(
+        r, inp.aspect, inp.b_peak_t, inp.sigma_tf_mpa * 1e6, inp.f_tf_struc,
+    )
+
+    def _fail(binding, n_e=0.0, i_p_ma=0.0, beta_n=0.0, h_req=0.0,
+              f_gw=0.0, tau_req=0.0, tau_nom=0.0, w_mj=0.0):
+        return PointResult(
+            t_i_kev=t_i_kev, r_major_m=r, a_minor_m=a, vol_plasma_m3=vol,
+            n_e_m3=n_e, i_p_ma=i_p_ma, beta_n=beta_n, h_required=h_req,
+            f_gw=f_gw, tau_e_required_s=tau_req, tau_e_nominal_s=tau_nom,
+            w_thermal_mj=w_mj, wall_load_mw_m2=wall_load,
+            p_sep_r_mw_m=p_sep_r, delta_tf_m=delta_tf,
+            blanket_thickness_m=inp.blanket_thickness_m,
+            feasible=False, binding_constraint=binding,
+        )
+
+    # CHECK 1: Neutron wall load (optional)
+    if inp.p_nw_max is not None and wall_load > inp.p_nw_max:
+        return _fail("wall_load")
+
+    # CHECK 2: P_sep/R (optional)
+    if inp.p_sep_r_max is not None and p_sep_r > inp.p_sep_r_max:
+        return _fail("p_sep_r")
+
+    # Density from fusion power
+    f_fuel = fuel["f_fuel"] * inp.f_fuel_dilution
+    e_fus = fuel["e_fusion_j"]
+    ne_sq = 4.0 * pb.p_fusion_mw * 1.0e6 / (
+        f_fuel**2 * sigmav * e_fus * vol * inp.profile_factor
+    )
+    if ne_sq <= 0:
+        return _fail("density_negative", h_req=999.0, f_gw=999.0)
+    n_e = np.sqrt(ne_sq)
+
+    kappa95 = inp.kappa * 0.95
+    triang95 = inp.triang * 0.95
+
+    i_p = compute_plasma_current(
+        r, a, inp.b_t, inp.kappa, kappa95, inp.triang, triang95, inp.q95_min,
+    )
+    i_p_ma = i_p / 1.0e6
+
+    # CHECK 3: Greenwald density limit
+    n_gw = compute_greenwald_density(i_p, a)
+    f_gw = n_e / n_gw
+    if f_gw > inp.f_gw_max:
+        return _fail("greenwald", n_e=n_e, i_p_ma=i_p_ma, f_gw=f_gw)
+
+    # Stored energy
+    t_e_kev = t_i_kev
+    w_thermal_j = 1.5 * vol * n_e * (t_e_kev + t_i_kev) * constants.KILOELECTRON_VOLT
+    w_thermal_mj = w_thermal_j / 1.0e6
+
+    # CHECK 4: Beta limit (Troyon)
+    avg_pressure = (2.0 / 3.0) * w_thermal_j / vol
+    beta = 2.0 * constants.RMU0 * avg_pressure / inp.b_t**2
+    beta_n = 100.0 * beta * a * inp.b_t / i_p_ma
+    if beta_n > inp.beta_n_max:
+        return _fail("beta", n_e=n_e, i_p_ma=i_p_ma, beta_n=beta_n,
+                      f_gw=f_gw, w_mj=w_thermal_mj)
+
+    # CHECK 5: Energy confinement (H-factor)
+    p_transport_mw = max(pb.p_loss_mw * (1.0 - inp.f_rad), 1.0e-3)
+    tau_required = w_thermal_j / (p_transport_mw * 1.0e6)
+    kappa_ipb = vol / (2.0 * np.pi * r * np.pi * a**2)
+    dnla19 = n_e * 1.0e-19
+
+    tau_nominal = iter_ipb98y2_confinement_time(
+        pcur=i_p_ma,
+        b_plasma_toroidal_on_axis=inp.b_t,
+        dnla19=dnla19,
+        p_plasma_loss_mw=p_transport_mw,
+        rmajor=r,
+        kappa_ipb=kappa_ipb,
+        aspect=inp.aspect,
+        afuel=fuel["m_fuel_amu"],
+    )
+
+    h_required = tau_required / tau_nominal if tau_nominal > 0 else 999.0
+    feasible = h_required <= inp.h_max
+    binding = "confinement" if not feasible else "none"
+
+    return PointResult(
+        t_i_kev=t_i_kev, r_major_m=r, a_minor_m=a, vol_plasma_m3=vol,
+        n_e_m3=n_e, i_p_ma=i_p_ma, beta_n=beta_n, h_required=h_required,
+        f_gw=f_gw, tau_e_required_s=tau_required, tau_e_nominal_s=tau_nominal,
+        w_thermal_mj=w_thermal_mj, wall_load_mw_m2=wall_load,
+        p_sep_r_mw_m=p_sep_r, delta_tf_m=delta_tf,
+        blanket_thickness_m=inp.blanket_thickness_m,
+        feasible=feasible, binding_constraint=binding,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Minimum radius search (bisection)
+# ---------------------------------------------------------------------------
+
+def find_minimum_radius(
+    t_i_kev: float,
+    sigmav: float,
+    pb: PowerBalanceResult,
+    inp: SizingInputs,
+    fuel: dict,
+    r_low: float = 2.0,
+    r_high: float = 20.0,
+    tol: float = 0.01,
+    max_iter: int = 60,
+) -> tuple[PointResult | None, str]:
+    """Bisect on R to find the smallest feasible major radius."""
+    point_high = check_feasibility(r_high, t_i_kev, sigmav, pb, inp, fuel)
+    if not point_high.feasible:
+        return None, point_high.binding_constraint
+
+    best_point = point_high
+
+    for _ in range(max_iter):
+        if r_high - r_low < tol:
+            break
+        r_mid = (r_low + r_high) / 2.0
+        point = check_feasibility(r_mid, t_i_kev, sigmav, pb, inp, fuel)
+        if point.feasible:
+            r_high = r_mid
+            best_point = point
+        else:
+            r_low = r_mid
+
+    r_check = max(r_low - tol, 0.1)
+    point_just_below = check_feasibility(r_check, t_i_kev, sigmav, pb, inp, fuel)
+    binding = point_just_below.binding_constraint if not point_just_below.feasible else "none"
+
+    return best_point, binding
+
+
+# ---------------------------------------------------------------------------
+# Main sizing routine
+# ---------------------------------------------------------------------------
+
+def TokamakSizeOptimizatIonTool(inp: SizingInputs) -> SizingResult:
+    """Run the full outside-in sizing: power balance -> T_i sweep -> R_min search."""
+    pb = top_down_power_balance(inp)
+    fuel = get_fuel_params(inp.fuel_type)
+
+    # Engineering floor on R (avoids wasting bisection iterations)
+    r_floor = 2.0
+    if inp.p_nw_max is not None and inp.p_nw_max > 0:
+        kappa_fac = np.sqrt((1.0 + inp.kappa**2) / 2.0)
+        r_wl = np.sqrt(pb.p_neutron_mw * inp.aspect
+                        / (4.0 * np.pi**2 * inp.p_nw_max * kappa_fac))
+        r_floor = max(r_floor, r_wl)
+    if inp.p_sep_r_max is not None and inp.p_sep_r_max > 0:
+        p_sep = pb.p_loss_mw * (1.0 - inp.f_rad)
+        r_floor = max(r_floor, p_sep / inp.p_sep_r_max)
+
+    t_i_values = np.linspace(
+        inp.t_i_range_kev[0], inp.t_i_range_kev[1], inp.t_i_steps,
+    )
+
+    sweep_results = []
+    best_r = float("inf")
+    best_point = None
+    best_binding = "none"
+
+    for t_i in t_i_values:
+        sigmav = bosch_hale_scalar(t_i, fuel["constants"])
+        if sigmav <= 0:
+            sweep_results.append((t_i, float("inf"), "no_reactivity"))
+            continue
+
+        point, binding = find_minimum_radius(
+            t_i, sigmav, pb, inp, fuel, r_low=r_floor,
+        )
+
+        if point is not None:
+            sweep_results.append((t_i, point.r_major_m, binding))
+            if point.r_major_m < best_r:
+                best_r = point.r_major_m
+                best_point = point
+                best_binding = binding
+        else:
+            sweep_results.append((t_i, float("inf"), binding))
+
+    if best_point is None:
+        raise RuntimeError(
+            "No feasible operating point found in the T_i sweep range. "
+            "Try relaxing constraints or increasing the T_i range."
+        )
+
+    # --- Inboard build post-check ---
+    # IB_required = Δ_TF_stress × margin + buffer ≤ R_inboard
+    delta_tf = compute_tf_coil_thickness(
+        best_point.r_major_m, inp.aspect, inp.b_peak_t,
+        inp.sigma_tf_mpa * 1e6, inp.f_tf_struc,
+    )
+    r_inboard = best_point.r_major_m * (1.0 - 1.0 / inp.aspect)
+    ib_required = delta_tf * inp.tf_build_margin + inp.tf_build_buffer
+    if ib_required > r_inboard:
+        # Build doesn't fit — compute R_floor analytically
+        # R(1-1/A) = margin × k/(1+k) × R(1-1/A) + buffer
+        # → R_floor = buffer / [(1-1/A) × (1 - margin × k/(1+k))]
+        mu0 = constants.RMU0
+        k_tf = inp.b_peak_t**2 / (
+            2.0 * mu0 * inp.f_tf_struc * inp.sigma_tf_mpa * 1e6
+        )
+        denom = (1.0 - 1.0 / inp.aspect) * (
+            1.0 - inp.tf_build_margin * k_tf / (1.0 + k_tf)
+        )
+        r_floor_build = inp.tf_build_buffer / denom
+        best_binding = "inboard_build"
+        sigmav_opt = bosch_hale_scalar(best_point.t_i_kev, fuel["constants"])
+        best_point = check_feasibility(
+            r_floor_build, best_point.t_i_kev, sigmav_opt, pb, inp, fuel,
+        )
+
+    return SizingResult(
+        r_major_m=best_point.r_major_m,
+        t_i_optimal_kev=best_point.t_i_kev,
+        p_fusion_mw=pb.p_fusion_mw,
+        p_gross_mw=pb.p_gross_mw,
+        p_recirc_mw=pb.p_recirc_mw,
+        p_thermal_mw=pb.p_thermal_mw,
+        p_hcd_injected_mw=pb.p_hcd_injected_mw,
+        q_plasma=pb.q_plasma,
+        n_e_m3=best_point.n_e_m3,
+        i_p_ma=best_point.i_p_ma,
+        beta_n=best_point.beta_n,
+        h_required=best_point.h_required,
+        f_gw=best_point.f_gw,
+        binding_constraint=best_binding,
+        vol_plasma_m3=best_point.vol_plasma_m3,
+        wall_load_mw_m2=best_point.wall_load_mw_m2,
+        p_sep_r_mw_m=best_point.p_sep_r_mw_m,
+        delta_tf_m=best_point.delta_tf_m,
+        blanket_thickness_m=best_point.blanket_thickness_m,
+        power_balance=pb,
+        sweep_results=sweep_results,
+    )
